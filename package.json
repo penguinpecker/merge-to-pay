@@ -3,6 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "description": "Merge-to-Pay — an agent that pays GitHub bounties in USDC on Base only after zkVerify has verified a zkTLS proof that the PR was merged.",
+  "homepage": "https://agent-production-8f9c2448.up.railway.app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/penguinpecker/merge-to-pay.git"
+  },
+  "bugs": {
+    "url": "https://github.com/penguinpecker/merge-to-pay/issues"
+  },
   "workspaces": [
     "packages/sdk",
     "packages/contracts",
