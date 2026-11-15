@@ -1,0 +1,58 @@
+name: Call merge-to-pay agent
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  notify-agent:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call agent and log decision
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          payload=$(jq -n --arg repo "$REPOSITORY" --arg number "$PR_NUMBER" '{pr: ($repo + "#" + $number)}')
+          # Only an explicit BUSY rejection is known to precede fresh work.
+          # Three attempts total, with 60 seconds between rejections.
+          for attempt in 1 2 3; do
+            status=0
+            result=$(curl --silent --show-error --fail-with-body \
+              --connect-timeout 15 --max-time 600 \
+              -X POST 'https://agent-production-8f9c2448.up.railway.app/api/agent?retry=1' \
+              -H 'content-type: application/json' --data "$payload" \
+              --write-out $'\n%{http_code}') || status=$?
+            http_code=${result##*$'\n'}
+            response=${result%$'\n'*}
+            if (( status == 22 && attempt < 3 )) && [[ $http_code == 503 ]] &&
+              printf '%s' "$response" | jq -s -e '
+                length == 1 and (.[0] | type == "object" and .decision == "ERROR" and .reason == "BUSY")
+              ' > /dev/null 2>&1; then
+              echo "Agent busy; retrying after 60 seconds (attempt $attempt of 3)." >&2
+              sleep 60
+              continue
+            fi
+            break
+          done
+
+          if ! printf '%s' "$response" | jq -s -e '
+            length == 1 and (.[0] | type == "object" and (.decision | type == "string") and (.reason | type == "string"))
+          ' > /dev/null; then
+            echo 'Agent returned an invalid response or the request failed.' >&2
+            exit 1
+          fi
+          printf 'Decision: %s\n' "$(printf '%s' "$response" | jq -c '.decision')"
+          printf 'Reason: %s\n' "$(printf '%s' "$response" | jq -c '.reason')"
+          if [[ $(printf '%s' "$response" | jq -r '.reason') == 'NOT_MERGED' ]]; then
+            echo 'Agent did not observe the merge; proof was not started for the merged PR.' >&2
+            exit 1
+          fi
+          if (( status != 0 )); then
+            echo "Agent request failed (curl exit $status)." >&2
+            exit "$status"
+          fi
