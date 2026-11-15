@@ -1,0 +1,81 @@
+name: Merge-to-Pay
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  notify-agent:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Call Merge-to-Pay agent
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+
+          AGENT_URL="https://agent-production-8f9c2448.up.railway.app/api/agent"
+          payload=$(jq -nc --arg pr "${REPO}#${PR_NUMBER}" '{pr: $pr}')
+          echo "Payload: ${payload}"
+
+          status=0
+          response=$(curl -sS --max-time 300 -X POST "${AGENT_URL}" \
+            -H "Content-Type: application/json" \
+            -d "${payload}") || status=$?
+
+          if [ "${status}" -ne 0 ]; then
+            echo "::error::Initial curl call to agent failed with exit code ${status}"
+            exit "${status}"
+          fi
+
+          echo "Response: ${response}"
+
+          decision=$(echo "${response}" | jq -r '.decision // empty')
+          reason=$(echo "${response}" | jq -r '.reason // empty')
+
+          if [ "${decision}" = "DECLINE" ] && [ "${reason}" = "NOT_MERGED" ]; then
+            echo "Received cached NOT_MERGED decision, retrying with ?retry=1..."
+            sleep 3
+            response=$(curl -sS --max-time 300 -X POST "${AGENT_URL}?retry=1" \
+              -H "Content-Type: application/json" \
+              -d "${payload}") || status=$?
+            if [ "${status}" -ne 0 ]; then
+              echo "::error::Retry curl call failed with exit code ${status}"
+              exit "${status}"
+            fi
+            echo "Response: ${response}"
+            decision=$(echo "${response}" | jq -r '.decision // empty')
+            reason=$(echo "${response}" | jq -r '.reason // empty')
+          elif [ "${decision}" = "ERROR" ] && [ "${reason}" = "BUSY" ]; then
+            echo "Agent is busy, retrying in 10 seconds with ?retry=1..."
+            sleep 10
+            response=$(curl -sS --max-time 300 -X POST "${AGENT_URL}?retry=1" \
+              -H "Content-Type: application/json" \
+              -d "${payload}") || status=$?
+            if [ "${status}" -ne 0 ]; then
+              echo "::error::Retry curl call failed with exit code ${status}"
+              exit "${status}"
+            fi
+            echo "Response: ${response}"
+            decision=$(echo "${response}" | jq -r '.decision // empty')
+            reason=$(echo "${response}" | jq -r '.reason // empty')
+          fi
+
+          if [ -z "${decision}" ]; then
+            echo "::error::Response is missing a valid decision field or is not valid JSON."
+            exit 1
+          fi
+
+          echo "Decision: ${decision}"
+          echo "Reason: ${reason}"
+
+          if [ "${decision}" = "ERROR" ]; then
+            echo "::error::Agent returned ERROR: ${reason}"
+            exit 1
+          fi
