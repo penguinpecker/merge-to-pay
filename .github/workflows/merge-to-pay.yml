@@ -1,0 +1,38 @@
+name: Call merge-to-pay agent
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  notify-agent:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call agent and log decision
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          payload=$(jq -n --arg repo "$REPOSITORY" --arg number "$PR_NUMBER" '{pr: ($repo + "#" + $number)}')
+          status=0
+          response=$(curl --silent --show-error --fail-with-body \
+            --connect-timeout 15 --max-time 600 \
+            -X POST 'https://agent-production-8f9c2448.up.railway.app/api/agent' \
+            -H 'content-type: application/json' --data "$payload") || status=$?
+
+          if ! printf '%s' "$response" | jq -e '
+            type == "object" and (.decision | type == "string") and (.reason | type == "string")
+          ' > /dev/null; then
+            echo 'Agent returned an invalid response or the request failed.' >&2
+            exit 1
+          fi
+          printf 'Decision: %s\n' "$(printf '%s' "$response" | jq -c '.decision')"
+          printf 'Reason: %s\n' "$(printf '%s' "$response" | jq -c '.reason')"
+          if (( status != 0 )); then
+            echo "Agent request failed (curl exit $status)." >&2
+            exit "$status"
+          fi
