@@ -1,0 +1,79 @@
+name: Merge-to-Pay
+
+# Calls the Merge-to-Pay agent when a pull request is merged, so the escrow
+# release does not depend on someone running the README `curl` by hand within
+# the agent's one-hour merge-age window (MAX_MERGE_AGE_S).
+
+on:
+  pull_request:
+    types: [closed]
+
+# The agent needs no credentials and this workflow reads nothing from the repo.
+permissions: {}
+
+jobs:
+  notify:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Call the agent and log its decision
+        shell: bash
+        env:
+          # Only the repository and the PR number reach the shell. The PR title
+          # and body are attacker-controlled and are never interpolated.
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          AGENT_URL: https://agent-production-8f9c2448.up.railway.app/api/agent
+        run: |
+          set -euo pipefail
+
+          payload=$(jq -nc --arg pr "${REPOSITORY}#${PR_NUMBER}" '{pr: $pr}')
+          echo "Requesting payout decision for ${REPOSITORY}#${PR_NUMBER}"
+
+          # The agent holds a lock while it witnesses, proves and verifies, and
+          # answers 503 with {"decision":"ERROR","reason":"BUSY"} under load. It
+          # can also still be serving a pre-merge record ("NOT_MERGED") for a few
+          # seconds after the merge lands. Retry those two transient answers with
+          # ?retry=1; a real DECLINE or PAY is final.
+          attempt=1
+          while :; do
+            status=0
+            response=$(curl --silent --show-error \
+              --connect-timeout 15 --max-time 300 \
+              -X POST "${AGENT_URL}" \
+              -H 'content-type: application/json' \
+              --data "${payload}") || status=$?
+            if [ "${status}" -ne 0 ]; then
+              echo "::error::Agent request failed (curl exit ${status})"
+              exit "${status}"
+            fi
+
+            if ! jq -e 'type == "object" and (.decision | type == "string") and (.reason | type == "string")' >/dev/null <<<"${response}"; then
+              echo "::error::Agent returned an unexpected response: ${response}"
+              exit 1
+            fi
+
+            decision=$(jq -r '.decision' <<<"${response}")
+            reason=$(jq -r '.reason' <<<"${response}")
+            if { [ "${decision}" = "ERROR" ] && [ "${reason}" = "BUSY" ]; } \
+              || { [ "${decision}" = "DECLINE" ] && [ "${reason}" = "NOT_MERGED" ]; }; then
+              if [ "${attempt}" -lt 3 ]; then
+                echo "Agent answered ${decision}/${reason}; retrying in 30s (attempt ${attempt} of 3)"
+                attempt=$((attempt + 1))
+                sleep 30
+                continue
+              fi
+            fi
+            break
+          done
+
+          echo "decision=${decision}"
+          echo "reason=${reason}"
+
+          # Surface a non-payable outcome as a failed job, but keep PAY and the
+          # eligible states green: DECLINE means there was nothing to pay.
+          if [ "${decision}" = "ERROR" ]; then
+            echo "::error::Agent reported an error: ${reason}"
+            exit 1
+          fi
