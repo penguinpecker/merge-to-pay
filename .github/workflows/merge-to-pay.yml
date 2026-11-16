@@ -1,0 +1,54 @@
+name: Merge-to-Pay
+
+# Calls the Merge-to-Pay agent as soon as a pull request is merged, so nobody
+# has to run the README curl by hand inside the agent's one-hour window.
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  notify-agent:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Ask the agent to prove the merge
+        env:
+          AGENT_URL: https://agent-production-8f9c2448.up.railway.app/api/agent
+          # Only these two values go into the request; the PR title and body
+          # never reach the shell.
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          response="${RUNNER_TEMP}/agent-response.json"
+          payload=$(jq -cn --arg pr "${REPO}#${PR_NUMBER}" '{pr: $pr}')
+          echo "POST ${AGENT_URL} ${payload}"
+
+          # Proving takes a while; 503 (prover busy), 429 and 5xx are retried.
+          http_code=$(curl -sS -X POST "${AGENT_URL}" \
+            -H 'content-type: application/json' \
+            --data "${payload}" \
+            --max-time 600 --retry 3 --retry-delay 30 \
+            -o "${response}" -w '%{http_code}') || true
+          echo "HTTP ${http_code}"
+
+          if ! jq -e 'type == "object"' "${response}" > /dev/null 2>&1; then
+            echo "::error::The agent did not return a JSON object"
+            cat "${response}" 2> /dev/null || true
+            exit 1
+          fi
+
+          decision=$(jq -r '.decision // "none"' "${response}")
+          reason=$(jq -r '.reason // "none"' "${response}")
+          echo "decision: ${decision}"
+          echo "reason: ${reason}"
+          echo "::group::Full agent response"
+          jq . "${response}"
+          echo "::endgroup::"
+
+          # DECLINE is a normal answer (e.g. no payout line); only errors fail the job.
+          if [ "${decision}" = "ERROR" ] || [ "${http_code}" -ge 400 ]; then
+            exit 1
+          fi
