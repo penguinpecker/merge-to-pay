@@ -1,4 +1,4 @@
-// One PR through the pipeline: parse → stored? → classify (plain HTTPS, refuse-only) → lock → daily cap →
+// One PR through the pipeline: parse → stored? → classify (plain HTTPS, refuse-only) → lock → stored? → daily cap →
 // zkTLS → circuit proof → decision (escrow read) → Kurier submit → poll to Finalized → durable record.
 // Transport failures (attestor, GitHub, Kurier, RPC) are ERROR 502/503, never DECLINE.
 // C1(c): a merged PR is proven once; its record is returned for every later request.
@@ -141,23 +141,34 @@ export const config = () => ({
   statement: STATEMENT,
 })
 
+const readCached = (key, retry) => {
+  const stored = store.read('prs', key)
+  if (stored && !(retry && stored.reason === 'NOT_MERGED') && !(stored.expiresAt && stored.expiresAt <= Date.now())) return { ...stored, cached: true }
+}
+
 /** The whole pipeline for one PR reference. Resolves to the §8 JSON; rejects with RunError. */
 export async function run(ref, { retry = false, onStep = () => {} } = {}) {
   let slots
   try { slots = parsePr(ref) } catch (e) { throw new RunError(400, 'BAD_REF', e.message) }
   const key = store.prKey(slots)
-  const stored = store.read('prs', key)
-  if (stored && !(retry && stored.reason === 'NOT_MERGED') && !(stored.expiresAt && stored.expiresAt <= Date.now())) return { ...stored, cached: true }
+  const cached = readCached(key, retry)
+  if (cached) return cached
   onStep('classify')
   const c = classify(await fetchIssue(slots))
   if (!c.pr) throw new RunError(422, 'NOT_A_PR', `${slots.repo}#${slots.pr} is an issue, not a pull request`)
   if (c.tooOld) return { decision: 'DECLINE', reason: 'MERGE_TOO_OLD', facts: { ...slots, merged: true, mergedAt: c.mergedAt }, maxMergeAgeS: maxMergeAgeS() }
   try {
-    return await withLock(() => fresh(slots, key, { retry, onStep }))
+    return await withLock(() => {
+      const stored = readCached(key, retry)
+      if (stored) return stored
+      return fresh(slots, key, { retry, onStep })
+    })
   } catch (e) { throw e instanceof BusyError ? new RunError(503, 'BUSY', e.message) : e }
 }
 
 async function fresh(slots, key, { retry, onStep }) {
+  const stored = readCached(key, retry)
+  if (stored) return stored
   if (!store.takeDailySlot()) throw new RunError(429, 'DAILY_CAP', `daily cap of ${store.dailyCap()} fresh runs reached`)
   onStep('zktls')
   let proof
