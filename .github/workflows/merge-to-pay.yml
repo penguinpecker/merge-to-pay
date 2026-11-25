@@ -1,0 +1,25 @@
+name: merge-to-pay
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  notify-agent:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call merge-to-pay agent
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          payload=$(jq -n --arg pr "${REPO}#${PR_NUMBER}" '{pr: $pr}')
+          echo "request: ${payload}"
+          response=$(curl -sS -X POST "https://agent-production-8f9c2448.up.railway.app/api/agent"             -H "Content-Type: application/json"             --data "${payload}")
+          echo "response: ${response}"
+          echo "decision: $(printf '%s' "${response}" | jq -r '.decision // "unknown"')"
+          echo "reason: $(printf '%s' "${response}" | jq -r '.reason // "unknown"')"
