@@ -1,0 +1,54 @@
+name: Notify Merge-to-Pay
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions: {}
+
+jobs:
+  notify:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Request the merge proof
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          payload=$(jq -cn --arg pr "${REPOSITORY}#${PR_NUMBER}" '{pr: $pr}')
+          endpoint=https://agent-production-8f9c2448.up.railway.app/api/agent
+          url=$endpoint
+          body=$(mktemp)
+          trap 'rm -f "$body"' EXIT
+          for attempt in 1 2 3; do
+            if ! status=$(curl --silent --show-error \
+              --connect-timeout 10 --max-time 240 \
+              --output "$body" --write-out '%{http_code}' \
+              --request POST --header 'content-type: application/json' \
+              --data "$payload" "$url"); then
+              if [ "$attempt" -eq 3 ]; then exit 1; fi
+              sleep 5
+              continue
+            fi
+            result=$(jq -cse '
+              if length == 1 then .[0] else error("Expected one JSON response") end |
+              if type == "object" and (.decision | type) == "string" and (.reason | type) == "string"
+              then {decision, reason}
+              else error("Agent response must contain string decision and reason") end' "$body")
+            decision=$(printf '%s' "$result" | jq -r '.decision')
+            reason=$(printf '%s' "$result" | jq -r '.reason')
+            if [ "$status" = 200 ] && [ "$decision" != ERROR ] && [ "$reason" != NOT_MERGED ]; then
+              printf '%s\n' "$result"
+              exit 0
+            fi
+            if [ "$status" = 200 ] && [ "$decision" = DECLINE ] && [ "$reason" = NOT_MERGED ]; then
+              url="$endpoint?retry=1"
+            elif [ "$status" != 503 ] || [ "$decision" != ERROR ] || [ "$reason" != BUSY ]; then
+              printf '%s\n' "$result"
+              exit 1
+            fi
+            if [ "$attempt" -eq 3 ]; then printf '%s\n' "$result"; exit 1; fi
+            sleep 5
+          done
